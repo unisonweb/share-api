@@ -49,7 +49,6 @@ module Share.Postgres.Definitions.Queries
 where
 
 import Control.Lens
-import Data.Bitraversable (bitraverse)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy.Char8 qualified as BL
 import Data.List.NonEmpty qualified as NE
@@ -67,6 +66,7 @@ import Share.Postgres.Definitions.Types qualified as DefnTypes
 import Share.Postgres.Definitions.LocalReferences
 import Share.Postgres.Hashes.Queries qualified as HashQ
 import Share.Postgres.IDs
+import Share.Postgres.Serialization qualified as S
 import Share.Prelude
 import Share.Utils.Lens (asListOfDeduped)
 import Share.Utils.Logging qualified as Logging
