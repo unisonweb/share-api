@@ -49,6 +49,7 @@ module Share.Postgres.Definitions.Queries
 where
 
 import Control.Lens
+import Data.Bitraversable (bitraverse)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy.Char8 qualified as BL
 import Data.List.NonEmpty qualified as NE
@@ -63,6 +64,7 @@ import Share.Postgres
 import Share.Postgres qualified as PG
 import Share.Postgres.Definitions.Types
 import Share.Postgres.Definitions.Types qualified as DefnTypes
+import Share.Postgres.Definitions.LocalReferences
 import Share.Postgres.Hashes.Queries qualified as HashQ
 import Share.Postgres.IDs
 import Share.Prelude
@@ -300,14 +302,15 @@ loadTermsByIdsOf ::
   m t
 loadTermsByIdsOf codebase trav s = do
   s & asListOfDeduped trav \termIds -> do
-    zipWith combine
+    zipWith3 combine termIds
       <$> (loadTermComponentElementByTermIdsOf codebase traversed termIds)
       <*> (termLocalReferencesOf traversed termIds)
   where
-    combine maybeTermComponentElement (Share.LocalIds {texts, hashes}) =
+    combine termId maybeTermComponentElement (Share.LocalIds {texts, hashes}) =
       maybeTermComponentElement <&> \(TermComponentElement trm typ) ->
         s2cTermWithType
-          ( LocalIds.LocalIds
+          ( "term id " <> tShow termId,
+            LocalIds.LocalIds
               { textLookup = Vector.fromList texts,
                 defnLookup = Vector.fromList hashes
               },
@@ -374,73 +377,105 @@ termLocalTextReferencesOf :: (QueryA m, HasCallStack) => Traversal s t TermId [T
 termLocalTextReferencesOf trav s = do
   s & asListOf trav \termIds -> do
     let numberedTermIds = zip [0 :: Int32 ..] termIds
-    queryListCol @[Text]
+    queryListRows @([Int32], [Text])
       [sql|
         WITH term_ids(ord, term_id) AS (
             SELECT * FROM ^{toTable numberedTermIds}
         )
-        SELECT (
+        SELECT
           -- Need COALESCE because array_agg will return NULL rather than the empty array
           -- if there are no results.
-          SELECT COALESCE(array_agg(text.text ORDER BY text_refs.local_index ASC), '{}') as text_array
+          (SELECT COALESCE(array_agg(text_refs.local_index ORDER BY text_refs.local_index ASC), '{}')
+            FROM term_local_text_references text_refs
+            WHERE term_ids.term_id = text_refs.term_id),
+          (SELECT COALESCE(array_agg(text.text ORDER BY text_refs.local_index ASC), '{}')
             FROM term_local_text_references text_refs
               JOIN text ON text_refs.text_id = text.id
-            WHERE term_ids.term_id = text_refs.term_id
-        ) AS texts
+            WHERE term_ids.term_id = text_refs.term_id)
         FROM term_ids
         ORDER BY term_ids.ord ASC
       |]
+      <&> validateLocalReferenceRows "term text references" termIds
 
 termLocalComponentReferencesOf :: (QueryA m, HasCallStack) => Traversal s t TermId [ComponentHash] -> s -> m t
 termLocalComponentReferencesOf trav s = do
   s & asListOf trav \termIds -> do
     let numberedTermIds = zip [0 :: Int32 ..] termIds
-    queryListCol @[ComponentHash]
+    queryListRows @([Int32], [ComponentHash])
       [sql|
         WITH term_ids(ord, term_id) AS (
             SELECT * FROM ^{toTable numberedTermIds}
         )
-        SELECT (
-            SELECT COALESCE(array_agg(component_hashes.base32 ORDER BY local_refs.local_index ASC), '{}') as component_hash_array
+        SELECT
+            (SELECT COALESCE(array_agg(local_refs.local_index ORDER BY local_refs.local_index ASC), '{}')
+              FROM term_local_component_references local_refs
+              WHERE local_refs.term_id = term_ids.term_id),
+            (SELECT COALESCE(array_agg(component_hashes.base32 ORDER BY local_refs.local_index ASC), '{}')
             FROM term_local_component_references local_refs
                 JOIN component_hashes ON local_refs.component_hash_id = component_hashes.id
-            WHERE local_refs.term_id = term_ids.term_id
-        ) AS component_hashes
+              WHERE local_refs.term_id = term_ids.term_id)
         FROM term_ids
         ORDER BY term_ids.ord ASC
       |]
+      <&> validateLocalReferenceRows "term hash references" termIds
 
-s2cTermWithType :: (ResolvedLocalIds, TermFormat.Term, TermFormat.Type) -> (V2.Term Symbol, V2.Type Symbol)
-s2cTermWithType (localIds, tm, tp) =
-  (resolveTermLocalIds localIds tm, resolveTypeLocalIds localIds tp)
+s2cTermWithType :: (Text, ResolvedLocalIds, TermFormat.Term, TermFormat.Type) -> (V2.Term Symbol, V2.Type Symbol)
+s2cTermWithType (context, localIds, tm, tp) =
+  (resolveTermLocalIds context localIds tm, resolveTypeLocalIds context localIds tp)
 
-resolveTermLocalIds :: ResolvedLocalIds -> TermFormat.Term -> V2.Term Symbol
-resolveTermLocalIds (LocalIds.LocalIds {textLookup, defnLookup}) =
+resolveTermLocalIds :: Text -> ResolvedLocalIds -> TermFormat.Term -> V2.Term Symbol
+resolveTermLocalIds context localIds term =
+  either (error . show) id $ resolveTermLocalIdsChecked context localIds term
+
+resolveTermLocalIdsChecked :: Text -> ResolvedLocalIds -> TermFormat.Term -> Either LocalReferenceError (V2.Term Symbol)
+resolveTermLocalIdsChecked context (LocalIds.LocalIds {textLookup, defnLookup}) =
   -- substitute the text and hashes back into the term
-  V2.extraMap substText substTermRef substTypeRef substTermLink substTypeLink id
+  V2.extraMapM substText substTermRef substTypeRef substTermLink substTypeLink pure
   where
-    substTermRef = bimap substText (fmap substHash)
-    substTypeRef = bimap substText substHash
-    substTermLink = bimap substTermRef substTypeRef
+    substTermRef = bitraverse substText (traverse substHash)
+    substTypeRef = bitraverse substText substHash
+    substTermLink = bitraverse substTermRef substTypeRef
     substTypeLink = substTypeRef
-    substText i = textLookup ^?! ix (fromIntegral i)
-    substHash i = unComponentHash $ (defnLookup ^?! ix (fromIntegral i))
+    substText i = lookupLocalReference context "text" i textLookup
+    substHash i = unComponentHash <$> lookupLocalReference context "hash" i defnLookup
 
 -- | implementation detail of {s,w}2c*Term*
-resolveTypeLocalIds :: ResolvedLocalIds -> TermFormat.Type -> V2.Type Symbol
-resolveTypeLocalIds (LocalIds.LocalIds {textLookup, defnLookup}) =
-  V2Type.rmap (bimap substText substHash)
+resolveTypeLocalIds :: Text -> ResolvedLocalIds -> TermFormat.Type -> V2.Type Symbol
+resolveTypeLocalIds context localIds typ =
+  either (error . show) id $ resolveTypeLocalIdsChecked context localIds typ
+
+resolveTypeLocalIdsChecked :: Text -> ResolvedLocalIds -> TermFormat.Type -> Either LocalReferenceError (V2.Type Symbol)
+resolveTypeLocalIdsChecked context (LocalIds.LocalIds {textLookup, defnLookup}) =
+  V2Type.rmapM (bitraverse substText substHash)
   where
-    substText i = textLookup ^?! ix (fromIntegral i)
-    substHash i = unComponentHash $ (defnLookup ^?! ix (fromIntegral i))
+    substText i = lookupLocalReference context "text" i textLookup
+    substHash i = unComponentHash <$> lookupLocalReference context "hash" i defnLookup
 
 -- | Resolves local ids within constructor type signatures so that it can be hashed.
-resolveConstructorTypeLocalIds :: ResolvedLocalIds -> DeclFormat.Type Symbol -> V2Type.TypeD Symbol
-resolveConstructorTypeLocalIds (LocalIds.LocalIds {textLookup, defnLookup}) =
+resolveConstructorTypeLocalIds :: Text -> ResolvedLocalIds -> DeclFormat.Type Symbol -> V2Type.TypeD Symbol
+resolveConstructorTypeLocalIds context (LocalIds.LocalIds {textLookup, defnLookup}) =
   V2Type.rmap (bimap substText (fmap substHash))
   where
-    substText i = textLookup ^?! ix (fromIntegral i)
-    substHash i = unComponentHash $ (defnLookup ^?! ix (fromIntegral i))
+    substText i = checkedLocalReference context "text" i textLookup
+    substHash i = unComponentHash $ checkedLocalReference context "hash" i defnLookup
+
+checkedLocalReference :: (Integral i) => Text -> Text -> i -> Vector.Vector a -> a
+checkedLocalReference context referenceKind localIndex values =
+  either (error . show) id $ lookupLocalReference context referenceKind localIndex values
+
+validateLocalReferenceRows :: (Show i) => Text -> [i] -> [([Int32], [a])] -> [[a]]
+validateLocalReferenceRows description ids rows
+  | length ids /= length rows =
+      error . show $
+        description <> ": expected " <> tShow (length ids) <> " rows, got " <> tShow (length rows)
+  | otherwise =
+      zipWith
+        ( \identifier (indices, values) ->
+            let context = description <> " for " <> tShow identifier
+             in either (error . show) id $ validateParallelLocalReferenceMappings context indices values
+        )
+        ids
+        rows
 
 loadDeclKindsOf :: (PG.QueryA m, HasCallStack) => Traversal s t TypeReferenceId (Maybe CT.ConstructorType) -> s -> m t
 loadDeclKindsOf trav s =
@@ -470,18 +505,18 @@ loadDeclsByRefIdsOf codebase trav s = do
     & asListOf trav %%~ \refs -> do
       mayTypeComponents <- loadTypeComponentElementsAndTypeIdsOf codebase traversed refs
       typeLocalReferencesOf (traversed . _Just . _2) mayTypeComponents
-        <&> (fmap . fmap) \(TypeComponentElement decl, Share.LocalIds {texts, hashes}) ->
+        <&> (fmap . fmap) \((TypeComponentElement decl, typeId), Share.LocalIds {texts, hashes}) ->
           let localIds = LocalIds.LocalIds {textLookup = Vector.fromList texts, defnLookup = Vector.fromList hashes}
-           in s2cDecl localIds decl
+           in s2cDecl ("type id " <> tShow typeId) localIds decl
 
 loadDeclByTypeComponentElementAndTypeIdsOf :: (QueryA m) => Traversal s t (TypeComponentElement, TypeId) (V2.Decl Symbol) -> s -> m t
 loadDeclByTypeComponentElementAndTypeIdsOf trav s =
   s
     & asListOf trav %%~ \ids -> do
       typeLocalReferencesOf (traversed . _2) ids
-        <&> fmap \(TypeComponentElement decl, Share.LocalIds {texts, hashes}) ->
+        <&> fmap \((TypeComponentElement decl, typeId), Share.LocalIds {texts, hashes}) ->
           let localIds = LocalIds.LocalIds {textLookup = Vector.fromList texts, defnLookup = Vector.fromList hashes}
-           in s2cDecl localIds decl
+           in s2cDecl ("type id " <> tShow typeId) localIds decl
 
 loadTypeComponentElementsAndTypeIdsOf :: (QueryA m) => CodebaseEnv -> Traversal s t TypeReferenceId (Maybe (TypeComponentElement, TypeId)) -> s -> m t
 loadTypeComponentElementsAndTypeIdsOf (CodebaseEnv codebaseUser) trav s = do
@@ -528,39 +563,45 @@ typeLocalTextReferencesOf :: (QueryA m) => Traversal s t TypeId [Text] -> s -> m
 typeLocalTextReferencesOf trav s =
   s
     & asListOf trav %%~ \typeIds -> do
-      queryListCol @[Text]
+      queryListRows @([Int32], [Text])
         [sql|
         WITH type_ids(ord, type_id) AS (
           SELECT t.ord, t.type_id FROM ^{toTable (ordered typeIds)} AS t(ord, type_id)
-        ) SELECT (
+        ) SELECT
             -- Need COALESCE because array_agg will return NULL rather than the empty array
             -- if there are no results.
-            SELECT COALESCE(array_agg(text.text ORDER BY text_refs.local_index ASC), '{}') as text_array
+            (SELECT COALESCE(array_agg(text_refs.local_index ORDER BY text_refs.local_index ASC), '{}')
+              FROM type_local_text_references text_refs
+              WHERE type_ids.type_id = text_refs.type_id),
+            (SELECT COALESCE(array_agg(text.text ORDER BY text_refs.local_index ASC), '{}')
               FROM type_local_text_references text_refs
                 JOIN text ON text_refs.text_id = text.id
-              WHERE type_ids.type_id = text_refs.type_id
-        ) AS texts
+              WHERE type_ids.type_id = text_refs.type_id)
         FROM type_ids
         ORDER BY type_ids.ord ASC
         |]
+        <&> validateLocalReferenceRows "type text references" typeIds
 
 typeLocalComponentReferencesOf :: (QueryA m) => Traversal s t TypeId [ComponentHash] -> s -> m t
 typeLocalComponentReferencesOf trav s = do
   s
     & asListOf trav %%~ \typeIds -> do
-      queryListCol @[ComponentHash]
+      queryListRows @([Int32], [ComponentHash])
         [sql|
             WITH type_ids(ord, type_id) AS (
               SELECT t.ord, t.type_id FROM ^{toTable (ordered typeIds)} AS t(ord, type_id)
-            ) SELECT (
-              SELECT COALESCE(array_agg(component_hashes.base32 ORDER BY local_refs.local_index ASC), '{}') as component_hash_array
+            ) SELECT
+              (SELECT COALESCE(array_agg(local_refs.local_index ORDER BY local_refs.local_index ASC), '{}')
+                FROM type_local_component_references local_refs
+                WHERE local_refs.type_id = type_ids.type_id),
+              (SELECT COALESCE(array_agg(component_hashes.base32 ORDER BY local_refs.local_index ASC), '{}')
                 FROM type_local_component_references local_refs
                   JOIN component_hashes ON local_refs.component_hash_id = component_hashes.id
-                WHERE local_refs.type_id = type_ids.type_id
-            ) AS component_hashes
+                WHERE local_refs.type_id = type_ids.type_id)
             FROM type_ids
             ORDER BY type_ids.ord ASC
         |]
+        <&> validateLocalReferenceRows "type hash references" typeIds
 
 expectDeclsByRefIdsOf :: (QueryM m) => CodebaseEnv -> Traversal s t Reference.Id (V2.Decl Symbol) -> s -> m t
 expectDeclsByRefIdsOf codebase trav s = do
@@ -571,8 +612,8 @@ expectDeclsByRefIdsOf codebase trav s = do
         (_, Just decl) -> pure decl
         (refId, Nothing) -> unrecoverableError $ InternalServerError "expected-decl" (expectedTermError $ Right refId)
 
-s2cDecl :: ResolvedLocalIds -> DeclFormat.Decl Symbol -> (V2.Decl Symbol)
-s2cDecl (LocalIds.LocalIds {textLookup, defnLookup}) V2.DataDeclaration {declType, modifier, bound, constructorTypes} =
+s2cDecl :: Text -> ResolvedLocalIds -> DeclFormat.Decl Symbol -> (V2.Decl Symbol)
+s2cDecl context (LocalIds.LocalIds {textLookup, defnLookup}) V2.DataDeclaration {declType, modifier, bound, constructorTypes} =
   V2.DataDeclaration
     { declType,
       modifier,
@@ -582,8 +623,8 @@ s2cDecl (LocalIds.LocalIds {textLookup, defnLookup}) V2.DataDeclaration {declTyp
   where
     resolveLocalRef :: V2.Reference' LocalIds.LocalTextId (Maybe LocalIds.LocalDefnId) -> V2.Reference' Text (Maybe Hash)
     resolveLocalRef = bimap substText (fmap (unComponentHash . substHash))
-    substText i = textLookup ^?! ix (fromIntegral i)
-    substHash i = defnLookup ^?! ix (fromIntegral i)
+    substText i = checkedLocalReference context "text" i textLookup
+    substHash i = checkedLocalReference context "hash" i defnLookup
 
 -- | Get the set of user-defined terms whose hash matches the given prefix.
 termReferencesByPrefix :: (QueryA m) => Text -> Maybe Word64 -> m (Set V1Reference.Id)
@@ -653,6 +694,7 @@ constructorReferentsByPrefix prefix mayComponentIndex mayConstructorIndex = do
 loadCachedEvalResult :: (QueryM m) => CodebaseEnv -> Reference.Id -> m (Maybe (V2.Term Symbol))
 loadCachedEvalResult CodebaseEnv {codebaseOwner} (Reference.Id hash compIndex) = runMaybeT do
   let compIndex' = pgComponentIndex compIndex
+      context = "cached term " <> tShow (hash, compIndex)
   (evalResultId :: EvalResultId, EvalResultTerm term) <-
     MaybeT $
       query1Row
@@ -665,29 +707,41 @@ loadCachedEvalResult CodebaseEnv {codebaseOwner} (Reference.Id hash compIndex) =
         AND result.component_index = #{compIndex'}
         AND sandboxed.user_id = #{codebaseOwner}
     |]
-  textLookup <-
-    Vector.fromList
-      <$> queryListCol
-        [sql|
-      SELECT text.text
-        FROM eval_result_local_text_references mapping
-          JOIN text ON mapping.text_id = text.id
-        WHERE mapping.eval_result_id = #{evalResultId}
-          ORDER BY mapping.local_index ASC
+  (textIndices, texts) <-
+    queryExpect1Row @([Int32], [Text])
+      [sql|
+      SELECT
+        (SELECT COALESCE(array_agg(mapping.local_index ORDER BY mapping.local_index ASC), '{}')
+          FROM eval_result_local_text_references mapping
+          WHERE mapping.eval_result_id = #{evalResultId}),
+        (SELECT COALESCE(array_agg(text.text ORDER BY mapping.local_index ASC), '{}')
+          FROM eval_result_local_text_references mapping
+            JOIN text ON mapping.text_id = text.id
+          WHERE mapping.eval_result_id = #{evalResultId})
       |]
-  defnLookup <-
-    Vector.fromList
-      <$> queryListCol
+  (hashIndices, hashes) <-
+    queryExpect1Row @([Int32], [ComponentHash])
         [sql|
-      SELECT component_hashes.base32
-        FROM eval_result_local_component_references mapping
-          JOIN component_hashes ON mapping.component_hash_id = component_hashes.id
-        WHERE mapping.eval_result_id = #{evalResultId}
-          ORDER BY mapping.local_index ASC
+      SELECT
+        (SELECT COALESCE(array_agg(mapping.local_index ORDER BY mapping.local_index ASC), '{}')
+          FROM eval_result_local_component_references mapping
+          WHERE mapping.eval_result_id = #{evalResultId}),
+        (SELECT COALESCE(array_agg(component_hashes.base32 ORDER BY mapping.local_index ASC), '{}')
+          FROM eval_result_local_component_references mapping
+            JOIN component_hashes ON mapping.component_hash_id = component_hashes.id
+          WHERE mapping.eval_result_id = #{evalResultId})
       |]
+  let textLookup =
+        Vector.fromList $
+          either (error . show) id $
+            validateParallelLocalReferenceMappings context textIndices texts
+      defnLookup =
+        Vector.fromList $
+          either (error . show) id $
+            validateParallelLocalReferenceMappings context hashIndices hashes
   let localIds :: ResolvedLocalIds
       localIds = LocalIds.LocalIds {textLookup, defnLookup}
-  pure $ resolveTermLocalIds localIds term
+  pure $ resolveTermLocalIds context localIds term
 
 -- | Get text ids for all provided texts, inserting any that don't already exist.
 ensureTextIds :: (QueryM m) => (Traversable t) => t Text -> m (t TextId)
@@ -882,8 +936,17 @@ saveEncodedTermComponent :: forall m. (QueryM m) => CodebaseEnv -> ComponentHash
 saveEncodedTermComponent codebase@(CodebaseEnv {codebaseOwner}) componentHash maySerialized elements = do
   componentHashId <- HashQ.ensureComponentHashIdsOf id componentHash
   let elementsTable = elements & imap \i _ -> pgComponentIndex $ fromIntegral @Int i
-  mayTermIds :: Maybe (NE.NonEmpty TermId) <-
-    queryListCol
+  elementsWithResolvedLocals <- resolveLocalIdsOf (traversed . _1) elements
+  for_ (zip [0 :: Int ..] elementsWithResolvedLocals) \(componentIndex, (localIds, elementBytes, _typeFormat)) -> do
+    let context = "term component " <> tShow componentHash <> " element " <> tShow componentIndex
+    case S.decodeTermAndType (termComponentElementBytes elementBytes) of
+      Left decodeError -> error $ show context <> ": couldn't decode term component element: " <> show decodeError
+      Right (term, typ) ->
+        case resolveTermLocalIdsChecked context localIds term >> (() <$ resolveTypeLocalIdsChecked context localIds typ) of
+          Left localReferenceError -> error $ show localReferenceError
+          Right () -> pure ()
+  existingTermIds <-
+    queryListCol @(Maybe TermId)
       [sql|
       WITH elements(component_index) AS (
         SELECT * FROM ^{singleColumnTable elementsTable}
@@ -891,13 +954,25 @@ saveEncodedTermComponent codebase@(CodebaseEnv {codebaseOwner}) componentHash ma
       SELECT term.id FROM elements
         -- Left join so we can verify we get a match for every element.
         LEFT JOIN terms term ON elements.component_index = term.component_index
-        WHERE term.component_hash_id = #{componentHashId}
+                              AND term.component_hash_id = #{componentHashId}
       ORDER BY elements.component_index
     |]
-      -- We expect to either have ALL the elements or NONE of them.
-      <&> \listOfMayTermIds -> sequenceA listOfMayTermIds >>= NE.nonEmpty
 
-  termIds <- mayTermIds `whenNothing` saveSharedTermAndLocalMappings componentHashId
+  termIds <-
+    case catMaybes existingTermIds of
+      [] -> saveSharedTermAndLocalMappings componentHashId elementsWithResolvedLocals
+      existing
+        | length existing == length elements ->
+            fromMaybe (error "saveEncodedTermComponent: empty existing component") (NE.nonEmpty existing)
+        | otherwise ->
+            error $
+              "Incomplete existing term component "
+                <> show componentHash
+                <> ": found "
+                <> show (length existing)
+                <> " of "
+                <> show (length elements)
+                <> " terms"
   let sandboxedTermsTable =
         zip (toList termIds) elements
           & fmap
@@ -927,17 +1002,17 @@ saveEncodedTermComponent codebase@(CodebaseEnv {codebaseOwner}) componentHash ma
       let serializedEntity = SyncV2.serialiseCBORBytes componentEntity
       saveSerializedComponent codebase chId serializedEntity
 
-    saveSharedTermAndLocalMappings :: ComponentHashId -> m (NE.NonEmpty TermId)
-    saveSharedTermAndLocalMappings componentHashId = do
+    saveSharedTermAndLocalMappings :: ComponentHashId -> [(ResolvedLocalIds, TermComponentElementBytes, TermFormat.Type)] -> m (NE.NonEmpty TermId)
+    saveSharedTermAndLocalMappings componentHashId elementsWithResolvedLocals = do
       let HashHandle {toReference = hashType} = v2HashHandle
-      elementsWithResolvedLocals <- resolveLocalIdsOf (traversed . _1) elements
       -- We need to save the shared terms for the first time.
       let termsTable :: [(PgComponentIndex, Maybe Text, Maybe ComponentHash, Maybe PgComponentIndex)]
           termsTable =
             elementsWithResolvedLocals
               & imap
                 ( \componentIndex (localIds, _elementBytes, typeFormat) ->
-                    let v2Type = resolveTypeLocalIds localIds typeFormat
+                    let context = "term component " <> tShow componentHash <> " element " <> tShow componentIndex
+                        v2Type = resolveTypeLocalIds context localIds typeFormat
                         (typ_builtin, typ_component_hash, typ_component_index) = case hashType v2Type of
                           V2Reference.Derived hash componentIndex -> (Nothing, Just hash, Just $ pgComponentIndex componentIndex)
                           V2.ReferenceBuiltin builtin -> (Just builtin, Nothing, Nothing)
@@ -1006,8 +1081,8 @@ saveTypeComponent :: forall m. (QueryM m) => CodebaseEnv -> ComponentHash -> May
 saveTypeComponent (codebase@CodebaseEnv {codebaseOwner}) componentHash maySerialized elements = do
   componentHashId <- HashQ.ensureComponentHashIdsOf id componentHash
   let elementsTable = elements & imap \i _ -> fromIntegral @Int @Int32 i
-  mayTypeIds :: Maybe (NE.NonEmpty TypeId) <-
-    queryListCol
+  existingTypeIds <-
+    queryListCol @(Maybe TypeId)
       [sql|
       WITH elements(component_index) AS (
         SELECT * FROM ^{singleColumnTable elementsTable}
@@ -1015,12 +1090,24 @@ saveTypeComponent (codebase@CodebaseEnv {codebaseOwner}) componentHash maySerial
       SELECT type.id FROM elements
         -- Left join so we can verify we get a match for every element we expect.
         LEFT JOIN types type ON elements.component_index = type.component_index
-        WHERE type.component_hash_id = #{componentHashId}
+                              AND type.component_hash_id = #{componentHashId}
       ORDER BY elements.component_index
     |]
-      -- We expect to either have ALL the elements or NONE of them.
-      <&> \listOfMayTypeIds -> sequenceA listOfMayTypeIds >>= NE.nonEmpty
-  typeIds <- mayTypeIds `whenNothing` saveSharedTypeAndLocalMappings componentHashId
+  typeIds <-
+    case catMaybes existingTypeIds of
+      [] -> saveSharedTypeAndLocalMappings componentHashId
+      existing
+        | length existing == length elements ->
+            fromMaybe (error "saveTypeComponent: empty existing component") (NE.nonEmpty existing)
+        | otherwise ->
+            error $
+              "Incomplete existing type component "
+                <> show componentHash
+                <> ": found "
+                <> show (length existing)
+                <> " of "
+                <> show (length elements)
+                <> " types"
   let sandboxedTypesTable =
         zip (toList typeIds) elements
           <&> ( \(typeId, (_localIds, decl)) ->
@@ -1061,7 +1148,14 @@ saveTypeComponent (codebase@CodebaseEnv {codebaseOwner}) componentHash maySerial
                 constructorTypes
                   & imap
                     ( \constructorIndex constructorTyp ->
-                        let (typeBuiltin, typeComponentHash, typeComponentIndex) = case hashConstructorType (unComponentHash componentHash) (resolveConstructorTypeLocalIds resolvedLocalIds constructorTyp) of
+                        let context =
+                              "type component "
+                                <> tShow componentHash
+                                <> " type id "
+                                <> tShow typeId
+                                <> " constructor "
+                                <> tShow constructorIndex
+                            (typeBuiltin, typeComponentHash, typeComponentIndex) = case hashConstructorType (unComponentHash componentHash) (resolveConstructorTypeLocalIds context resolvedLocalIds constructorTyp) of
                               V2Reference.Derived hash componentIndex -> (Nothing, Just hash, Just $ pgComponentIndex componentIndex)
                               V2.ReferenceBuiltin builtin -> (Just builtin, Nothing, Nothing)
                          in ( typeId,

@@ -14,7 +14,7 @@ data LocalReferenceError
   = MissingLocalReference
       { context :: Text,
         referenceKind :: Text,
-        index :: Integer,
+      requestedIndex :: Integer,
         lookupSize :: Int
       }
   | NonContiguousLocalReference
@@ -31,9 +31,9 @@ data LocalReferenceError
 
 lookupLocalReference :: (Integral i) => Text -> Text -> i -> Vector.Vector a -> Either LocalReferenceError a
 lookupLocalReference context referenceKind localIndex values =
-  case Vector.!? values index of
+  case if indexInteger < 0 || indexInteger > toInteger (maxBound :: Int) then Nothing else Vector.!? values (fromInteger indexInteger) of
     Just value -> Right value
-    Nothing -> Left MissingLocalReference {context, referenceKind, index = indexInteger, lookupSize = Vector.length values}
+    Nothing -> Left MissingLocalReference {context, referenceKind, requestedIndex = indexInteger, lookupSize = Vector.length values}
   where
     indexInteger = toInteger localIndex
     index = fromInteger indexInteger
