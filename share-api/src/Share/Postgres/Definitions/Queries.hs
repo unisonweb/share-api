@@ -382,17 +382,17 @@ termLocalTextReferencesOf trav s = do
         WITH term_ids(ord, term_id) AS (
             SELECT * FROM ^{toTable numberedTermIds}
         )
-        SELECT
-          -- Need COALESCE because array_agg will return NULL rather than the empty array
-          -- if there are no results.
-          (SELECT COALESCE(array_agg(text_refs.local_index ORDER BY text_refs.local_index ASC), '{}')
-            FROM term_local_text_references text_refs
-            WHERE term_ids.term_id = text_refs.term_id),
-          (SELECT COALESCE(array_agg(text.text ORDER BY text_refs.local_index ASC), '{}')
-            FROM term_local_text_references text_refs
-              JOIN text ON text_refs.text_id = text.id
-            WHERE term_ids.term_id = text_refs.term_id)
+        SELECT local_refs.local_indices, local_refs.local_values
         FROM term_ids
+        CROSS JOIN LATERAL (
+          SELECT
+            -- Need COALESCE because array_agg returns NULL if there are no results.
+            COALESCE(array_agg(text_refs.local_index ORDER BY text_refs.local_index ASC), '{}') AS local_indices,
+            COALESCE(array_agg(text.text ORDER BY text_refs.local_index ASC), '{}') AS local_values
+          FROM term_local_text_references text_refs
+            JOIN text ON text_refs.text_id = text.id
+          WHERE term_ids.term_id = text_refs.term_id
+        ) local_refs
         ORDER BY term_ids.ord ASC
       |]
       <&> validateLocalReferenceRows "term text references" termIds
@@ -406,15 +406,16 @@ termLocalComponentReferencesOf trav s = do
         WITH term_ids(ord, term_id) AS (
             SELECT * FROM ^{toTable numberedTermIds}
         )
-        SELECT
-            (SELECT COALESCE(array_agg(local_refs.local_index ORDER BY local_refs.local_index ASC), '{}')
-              FROM term_local_component_references local_refs
-              WHERE local_refs.term_id = term_ids.term_id),
-            (SELECT COALESCE(array_agg(component_hashes.base32 ORDER BY local_refs.local_index ASC), '{}')
-            FROM term_local_component_references local_refs
-                JOIN component_hashes ON local_refs.component_hash_id = component_hashes.id
-              WHERE local_refs.term_id = term_ids.term_id)
+        SELECT local_refs.local_indices, local_refs.local_values
         FROM term_ids
+        CROSS JOIN LATERAL (
+          SELECT
+            COALESCE(array_agg(local_refs.local_index ORDER BY local_refs.local_index ASC), '{}') AS local_indices,
+            COALESCE(array_agg(component_hashes.base32 ORDER BY local_refs.local_index ASC), '{}') AS local_values
+          FROM term_local_component_references local_refs
+            JOIN component_hashes ON local_refs.component_hash_id = component_hashes.id
+          WHERE local_refs.term_id = term_ids.term_id
+        ) local_refs
         ORDER BY term_ids.ord ASC
       |]
       <&> validateLocalReferenceRows "term hash references" termIds
@@ -567,17 +568,17 @@ typeLocalTextReferencesOf trav s =
         [sql|
         WITH type_ids(ord, type_id) AS (
           SELECT t.ord, t.type_id FROM ^{toTable (ordered typeIds)} AS t(ord, type_id)
-        ) SELECT
-            -- Need COALESCE because array_agg will return NULL rather than the empty array
-            -- if there are no results.
-            (SELECT COALESCE(array_agg(text_refs.local_index ORDER BY text_refs.local_index ASC), '{}')
-              FROM type_local_text_references text_refs
-              WHERE type_ids.type_id = text_refs.type_id),
-            (SELECT COALESCE(array_agg(text.text ORDER BY text_refs.local_index ASC), '{}')
-              FROM type_local_text_references text_refs
-                JOIN text ON text_refs.text_id = text.id
-              WHERE type_ids.type_id = text_refs.type_id)
+        ) SELECT local_refs.local_indices, local_refs.local_values
         FROM type_ids
+        CROSS JOIN LATERAL (
+          SELECT
+            -- Need COALESCE because array_agg returns NULL if there are no results.
+            COALESCE(array_agg(text_refs.local_index ORDER BY text_refs.local_index ASC), '{}') AS local_indices,
+            COALESCE(array_agg(text.text ORDER BY text_refs.local_index ASC), '{}') AS local_values
+          FROM type_local_text_references text_refs
+            JOIN text ON text_refs.text_id = text.id
+          WHERE type_ids.type_id = text_refs.type_id
+        ) local_refs
         ORDER BY type_ids.ord ASC
         |]
         <&> validateLocalReferenceRows "type text references" typeIds
@@ -590,15 +591,16 @@ typeLocalComponentReferencesOf trav s = do
         [sql|
             WITH type_ids(ord, type_id) AS (
               SELECT t.ord, t.type_id FROM ^{toTable (ordered typeIds)} AS t(ord, type_id)
-            ) SELECT
-              (SELECT COALESCE(array_agg(local_refs.local_index ORDER BY local_refs.local_index ASC), '{}')
-                FROM type_local_component_references local_refs
-                WHERE local_refs.type_id = type_ids.type_id),
-              (SELECT COALESCE(array_agg(component_hashes.base32 ORDER BY local_refs.local_index ASC), '{}')
-                FROM type_local_component_references local_refs
-                  JOIN component_hashes ON local_refs.component_hash_id = component_hashes.id
-                WHERE local_refs.type_id = type_ids.type_id)
+            ) SELECT local_refs.local_indices, local_refs.local_values
             FROM type_ids
+            CROSS JOIN LATERAL (
+              SELECT
+                COALESCE(array_agg(local_refs.local_index ORDER BY local_refs.local_index ASC), '{}') AS local_indices,
+                COALESCE(array_agg(component_hashes.base32 ORDER BY local_refs.local_index ASC), '{}') AS local_values
+              FROM type_local_component_references local_refs
+                JOIN component_hashes ON local_refs.component_hash_id = component_hashes.id
+              WHERE local_refs.type_id = type_ids.type_id
+            ) local_refs
             ORDER BY type_ids.ord ASC
         |]
         <&> validateLocalReferenceRows "type hash references" typeIds
