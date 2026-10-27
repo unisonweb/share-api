@@ -198,6 +198,14 @@ library:
     - condition: false
       other-modules: Paths_share_api
 
+tests:
+  local-reference-tests:
+    main: LocalReferencesSpec.hs
+    source-dirs: test
+    dependencies:
+    - share-api
+    - vector
+
 executables:
   share-api:
     when:
