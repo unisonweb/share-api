@@ -1,8 +1,10 @@
 # Updating Share to a new Unison release
 
-Share builds against the `unison` git submodule (`./unison`) and is tested with transcripts that run a real `ucm`.
-Each time Unison cuts a release (tag `release/X.Y.Z`), Share needs to be moved onto it.
-This document is a step-by-step checklist for doing that. Every step has an explicit command and a way to check it worked.
+Share builds against the `unison` git submodule (`./unison`) and is tested with transcripts that run a real `ucm`. Each time Unison cuts a release (tag `release/X.Y.Z`), Share needs to be moved onto it.
+This document is a step-by-step checklist for doing that, from preparing the change locally through to deploying it. Every step has an explicit command and a way to check it worked.
+
+Steps 1-9 only affect your local machine. Steps 10-18 (push, PR, merge, image, jobs repo, backup, migrations, deploy, rollback) touch shared
+and production systems. If you are a software agent, be sure to ask for explicit approval from the user before each is run.
 
 Throughout, `X.Y.Z` is the target Unison version, e.g. `2.0.0`.
 
@@ -215,7 +217,10 @@ git commit -m "Bump CI ucm to release/X.Y.Z"
 git status -sb      # must be clean
 ```
 
-Do not push or open a PR unless asked.
+Stop here unless you have been given explicit approval for the next phase. Steps 1-8 only affect your local machine.
+Everything from step 9 onwards touches shared systems (GitHub, the container registry, production), so each of
+those steps needs **explicit approval from the user or maintainer before it is run**. Ask first; don't assume that approval
+for one step covers the next.
 
 ### 9. Clean up local services
 
@@ -223,6 +228,147 @@ Do not push or open a PR unless asked.
 docker compose -f docker/docker-compose.base.yml down
 colima stop            # optional, frees the VM's memory
 ```
+
+## Shipping the release
+
+These steps publish and deploy the change. They require explicit approval (see above) and credentials the agent may not have
+(GitHub, AWS, Nomad). If you are an agent following these instructions and lack access to something, stop and tell the user exactly what's left to do rather than guessing!
+
+### Setup for shipping
+
+Before step 14 you need:
+
+- `gh` logged in to GitHub with push access to `unisonweb/share-api` and the `jobs` repo (`gh auth status`).
+- The Nomad CLI: `brew install hashicorp/tap/nomad`, then check `nomad version`. The `jobs` repo's `flake.nix` pins Nomad 1.8; if `nomad plan` or
+  `nomad run` behaves oddly with a newer CLI, a version mismatch is a suspect.
+- **Tailscale, connected.** The Nomad cluster is only reachable over the company tailnet. Its hostname resolves to private
+  `172.20.x.x` addresses, so without Tailscale every Nomad command just times out.
+  ```sh
+  /Applications/Tailscale.app/Contents/MacOS/Tailscale status   # the `tailscale` CLI may not be on PATH on macOS; this path is the app's bundled CLI
+  ```
+  It should list peers (for example `bastion-us-west-2-1`) and not report being stopped or logged out. If it isn't connected, ask
+  the user to connect it; you can't do that for them.
+- The Nomad environment, which comes from the `jobs` repo rather than from installing the CLI. `jobs/.envrc` sets `NOMAD_ADDR`
+  (`http://nomad.us-west-2.unison-lang.org:4646`), `VAULT_ADDR`, `CONSUL_HTTP_ADDR` and `LOKI_ADDR`. Load it with
+  [direnv](https://direnv.net) (`brew install direnv`, then `direnv allow` inside the `jobs` checkout), or without direnv:
+  ```sh
+  cd <jobs checkout> && source ./.envrc && echo $NOMAD_ADDR
+  ```
+  `.envrc` also sources an optional, uncommitted `./.envrc.private`. Put any personal secrets there, such as a `NOMAD_TOKEN`.
+  Never commit tokens or paste them into logs or PRs. Nothing in the `jobs` repo mentions TLS variables
+  (`NOMAD_CACERT`, etc.); the address is plain HTTP over the tailnet.
+
+  **A `NOMAD_TOKEN` is required.** Even read-only commands like `nomad status` are rejected without one
+  (`Error querying jobs: Unexpected response code: 403 (Permission denied)`), and `nomad run` needs a token with permission to run jobs
+  in production. Put it in `./.envrc.private` in the `jobs` checkout as `export NOMAD_TOKEN=...`. If you don't have one, stop immediately. Don't try to work around the 403.
+
+  > **TODO:** say where tokens are issued and which policy/role a deployer needs.
+
+- Check that you can reach the cluster before you need it (with Tailscale connected and the environment loaded):
+  ```sh
+  curl -s -m 5 "$NOMAD_ADDR/v1/status/leader"   # prints the cluster leader's address (HTTP 200)
+  nomad status                                  # read-only: lists jobs; a 403 "Permission denied" means the token is missing or insufficient
+  ```
+  A timeout means Tailscale is off or not routing to the cluster. A 403 means a missing or insufficient `NOMAD_TOKEN`.
+  In either case you can't deploy; stop and tell the user what failed.
+- Access to the AWS console for the Postgres backup in step 15, and to the production database for any migrations in step 16.
+
+### 10. Push and open a PR
+
+```sh
+git push -u origin update-unison-X.Y.Z
+gh pr create --base main --head update-unison-X.Y.Z --title "Update unison submodule to release/X.Y.Z" --body "<summary, testing done, anything not run>"
+```
+
+In the PR description, list the code adaptations, which golden files changed and why, and what you did and did not test
+(e.g. that `make reset_fixtures` was not run).
+
+### 11. Get CI passing
+
+CI must be green before anything is merged. Check with `gh pr checks <PR number>`. The CI `ucm` pin was already bumped in step 7,
+and that is the part you can't verify locally, so look closely at the transcript job. If CI fails, fix the cause on the
+branch and push again. Don't merge with a red CI, and don't "fix" a failure by committing different golden files unless you've
+reviewed the diff the way step 5 describes.
+
+### 12. Merge to `main`
+
+Use a **merge commit** (not squash or rebase), which keeps the separate code / transcripts / CI / docs commits in history:
+
+```sh
+gh pr merge <PR number> --merge
+git checkout main && git pull
+git log --oneline -5       # confirm the merge is on main
+```
+
+### 13. Find the image that CI published
+
+A CI step builds and publishes a container image to the repo's Packages tab:
+https://github.com/unisonweb/share-api/pkgs/container/share-api
+
+Tags look like `main_2026-10-05-19-11_gitref-e1dc80b`: the branch, a timestamp, and the short git hash of the commit that was built.
+
+1. Wait for CI on `main` (the run triggered by your merge) to finish.
+2. Open the Packages page and find the newest tag.
+3. Confirm it is the build you expect: the `gitref-` hash must match the merge commit you just made, and the timestamp must be after the merge.
+   ```sh
+   git rev-parse --short=7 origin/main
+   ```
+   The example tag starts with `main_`, so use the build from `main`, not one from a feature branch.
+4. Copy the full tag. Do not use a tag from an earlier run just because it looks similar.
+
+### 14. Update the tag in the jobs repo
+
+Deployment config lives in a separate repo: https://github.com/unisoncomputing/jobs
+
+1. Clone it and open `share.hcl`.
+2. Find the line that sets the Share container image tag (it is near the top of the file) and replace the tag with the one from step 13. Change nothing else.
+3. Don't run anything yet. Do the backup and migration checks below first.
+
+### 15. Back up Postgres
+
+Take a Postgres backup before deploying anything that would affect the data stored in the database. Do this from the Amazon (AWS) Postgres dashboard.
+
+> **TODO:** this document doesn't yet say exactly where in the AWS console to take the backup or who has
+> permission.
+
+### 16. Check the new code against the existing production data, and apply any migrations
+
+Production holds data written by the *old* code. Before deploying, think through everything the new code expects of the old codebase and database, and perform any Postgres migrations that are needed.
+
+- Look for new or changed files in `sql/` since the last deploy (`git log --stat -- sql/`).
+- Think about what the Unison upgrade changes about stored data: any changes to serialization or hashing formats, codebase / sync
+  versions, or anything else the new Unison libraries read or write that old rows might not satisfy. Read the upstream release notes
+  for the Unison release.
+- Schema changes are applied by hand. Everything needed is in `sql/`, ordered by timestamp, and you copy-paste the SQL into a
+  Postgres terminal session. See "Managing Postgres Migrations" in the README.
+- Run migrations inside a transaction so you can abort if something goes wrong:
+  ```
+  > BEGIN;
+  > <run migrations>
+  > COMMIT;
+  ```
+
+If you aren't sure whether a migration is needed, or you don't have production database access, stop and ask for help. Don't deploy.
+
+### 17. Deploy
+
+ONLY after steps 15 and 16 are complete, and with explicit approval, from the root of your `jobs` checkout (with Nomad configured for the cluster):
+
+```sh
+nomad run ./share.hcl
+```
+
+Then check that the new job version is running (Nomad UI or `nomad job status`) and that Share is healthy.
+
+### 18. Rolling back
+
+> **Verify with a maintainer.** This is the expected shape of a rollback, not a tested runbook.
+
+- **Code only (no migrations were applied):** set the image tag in `share.hcl` back to the previous tag (find it in the git
+  history of `jobs`, or from the Packages page) and run `nomad run ./share.hcl` again.
+- **Migrations were applied:** reverting the image alone may not be safe because the old code might not work with the new schema.
+  Decide with a maintainer whether to run a reverse migration or restore the backup from step 15 before redeploying the old image.
+  Restoring a backup discards writes made since it was taken, so don't do it without approval.
 
 ## Not part of this process
 
@@ -241,3 +387,11 @@ colima stop            # optional, frees the VM's memory
 - [ ] CI `ucm` version bumped to X.Y.Z
 - [ ] Commits made (code, transcripts, CI); working tree clean
 - [ ] Docker services stopped
+- [ ] *(approval needed from here on)* Branch pushed, PR opened
+- [ ] CI green on the PR
+- [ ] PR merged to `main` with a merge commit
+- [ ] Image tag found on the Packages page; its `gitref-` hash matches the merge commit
+- [ ] Tag updated in `share.hcl` in the `jobs` repo
+- [ ] Postgres backup taken
+- [ ] Old-data expectations reviewed, migrations applied if needed
+- [ ] `nomad run ./share.hcl` done and the new version verified
