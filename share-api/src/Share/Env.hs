@@ -39,6 +39,7 @@ import System.Log.Raven qualified as Sentry
 import System.Log.Raven.Transport.HttpConduit qualified as Sentry
 import System.Log.Raven.Types qualified as Sentry
 import Unison.Runtime.Interface as RT
+import Unison.Runtime.JIT qualified as JIT
 
 withEnv :: (Env () -> IO a) -> IO a
 withEnv action = do
@@ -127,7 +128,8 @@ withEnv action = do
   let pgSettings = Pool.settings [Pool.staticConnectionSettings postgresConfig, Pool.size postgresConnMax, Pool.acquisitionTimeout pgConnectionAcquisitionTimeout, Pool.idlenessTimeout pgConnectionMaxIdleTime, Pool.agingTimeout pgConnectionMaxLifetime]
   pgConnectionPool <- Pool.acquire pgSettings
   timeCache <- FL.newTimeCache FL.simpleTimeFormat -- E.g. 05/Sep/2023:13:23:56 -0700
-  sandboxedRuntime <- RT.startRuntime True RT.Persistent "share"
+  jit <- JIT.readConfig >>= JIT.newJIT
+  sandboxedRuntime <- RT.startRuntime jit True RT.Persistent
 
   proxiedHttpClient <- do
     if Deployment.onLocal

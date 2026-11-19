@@ -366,6 +366,8 @@ typeSigTokens typ =
           Type.Effects as -> first removeVars <$> Monoid.foldMapM id as
           Type.Forall a -> a
           Type.IntroOuter a -> a
+          -- Record types: treat the field types and any extra-fields row like type applications.
+          Type.Record tail_ fields -> Monoid.foldMapM id (toList tail_ <> Map.elems fields)
     removeVars :: MonoidalMap (Either VarId TypeReference) (Occurrence, Any) -> MonoidalMap (Either VarId TypeReference) (Occurrence, Any)
     removeVars = MonMap.filterWithKey (\k _ -> isRight k)
     nextVarId :: TokenGenM v VarId
