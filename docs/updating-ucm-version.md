@@ -307,7 +307,20 @@ https://github.com/unisonweb/share-api/pkgs/container/share-api
 
 Tags look like `main_2026-10-05-19-11_gitref-e1dc80b`: the branch, a timestamp, and the short git hash of the commit that was built.
 
-1. Wait for CI on `main` (the run triggered by your merge) to finish.
+**Why you have to wait for a second CI run, even though CI already passed on the PR.** The same workflow behaves differently depending
+on what triggered it (see `is_published_build` in `.github/workflows/ci.yaml`):
+
+- On a **pull request**, CI builds with `stack build --fast` (unoptimized) and builds the Docker image but does **not** push it. Its
+  computed tag has no branch name in it and uses the PR's merge-ref hash, and it is never published. There is nothing to deploy from a PR run.
+- On a **push to `main`** (or `staging`), CI builds with `-O2` (the optimized production binary) and **pushes** the image to the registry.
+  Only this run produces an image you can deploy.
+
+So merging the PR starts a new run on `main`, and its image is the one you want. That run compiles with `-O2`, so expect it to take
+at least as long as the PR run (about 45 minutes with a cold cache, and possibly longer). Don't poll it in a loop; check back when it should
+be done, or when the user says it is.
+
+1. Wait for CI on `main` (the run triggered by your merge) to finish. Find it with `gh run list --branch main --limit 3`, and make sure the
+   run's commit is your merge commit and its conclusion is `success`.
 2. Open the Packages page and find the newest tag.
 3. Confirm it is the build you expect: the `gitref-` hash must match the merge commit you just made, and the timestamp must be after the merge.
    ```sh
@@ -321,8 +334,20 @@ Tags look like `main_2026-10-05-19-11_gitref-e1dc80b`: the branch, a timestamp, 
 Deployment config lives in a separate repo: https://github.com/unisoncomputing/jobs
 
 1. Clone it and open `share.hcl`.
-2. Find the line that sets the Share container image tag (it is near the top of the file) and replace the tag with the one from step 13. Change nothing else.
-3. Don't run anything yet. Do the backup and migration checks below first.
+2. Find the `share_docker_image_tag` variable at the top of the file. Its `default = "..."` line holds the tag that production runs.
+   **Write down the old tag before you change it.** You need it for the migration check in step 16 and for rolling back in step 18.
+   The `gitref-` part of that tag is the short hash of the `share-api` commit currently deployed.
+3. Replace the tag with the one from step 13. Change nothing else.
+4. Don't run anything yet. Do the backup and migration checks below first.
+
+Notes about this repo:
+
+- The `jobs` repo's default branch is `trunk`, not `main`. If you open a PR for the tag change, use `--base trunk`
+  (`gh pr create --base trunk ...`); `--base main` fails with "Base ref must be a branch". The PR description should give the old and
+  new tags, the backup/migration status, and the deploy and rollback commands.
+- Production is deployed directly. There is no staging-first step in this process (`share-staging.hcl` exists, but it isn't used for this).
+- The `jobs` README says to take a build number from Drone. That is out of date. Use the ghcr tag from step 13, as the comment in `share.hcl` says.
+- Don't touch `share-task-runner.hcl` or the jobs under `migrations/`. See "Not part of this process" below.
 
 ### 15. Back up Postgres
 
@@ -335,7 +360,15 @@ Take a Postgres backup before deploying anything that would affect the data stor
 
 Production holds data written by the *old* code. Before deploying, think through everything the new code expects of the old codebase and database, and perform any Postgres migrations that are needed.
 
-- Look for new or changed files in `sql/` since the last deploy (`git log --stat -- sql/`).
+- **Check whether `sql/` changed since the version that production runs.** Take the `gitref-` hash from the *old* tag you wrote down in
+  step 14 (for example `3fd7c03`) and diff against the commit you're deploying:
+  ```sh
+  git cat-file -t <old-gitref>                          # must print "commit"; if not, `git fetch origin` first
+  git diff --stat <old-gitref> origin/main -- sql       # empty output = no schema changes to apply
+  git log --oneline <old-gitref>..origin/main -- sql    # which commits touched it, if any
+  ```
+  If this is empty, there are no SQL migrations to apply. Say so in your report. If it shows files, those are the migrations to apply, in
+  timestamp order, and you must apply them **before** deploying. For the 2.0.0 upgrade this check was empty.
 - Think about what the Unison upgrade changes about stored data: any changes to serialization or hashing formats, codebase / sync
   versions, or anything else the new Unison libraries read or write that old rows might not satisfy. Read the upstream release notes
   for the Unison release.
@@ -371,6 +404,14 @@ Then check that the new job version is running (Nomad UI or `nomad job status`) 
   Restoring a backup discards writes made since it was taken, so don't do it without approval.
 
 ## Not part of this process
+
+- **`share-task-runner.hcl` in the `jobs` repo.** The task runner is a separate one-off batch job (it runs checks such as the ambiguous
+  component check). Its image is only built from branches named `task-*`, never from `main`, so merging to `main` doesn't produce one.
+  It doesn't need updating for a Unison release. Only run or bump it when someone wants to rerun that check in production.
+  (`make task-runner` in step 6 only verifies that the task runner still works locally.)
+- **The jobs under `migrations/` in the `jobs` repo** (`share-prod-migration.hcl`, `share-staging-migration.hcl`). These are batch jobs
+  that use `ENLIL_*` variables and an old ECR image (Enlil is a former name of Share). They look like legacy tooling and are not how
+  Postgres schema changes are applied. Don't run them as part of a Unison upgrade. Schema changes are the SQL files in `sql/` (step 16).
 
 - `make reset_fixtures` wipes your **local** development database (`docker_postgresVolume`) and re-imports projects from the live Share.
   It's for preparing local dev data, not for validating a Unison upgrade. Do not run it unless the maintainer asks.
