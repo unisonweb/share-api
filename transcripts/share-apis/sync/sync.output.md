@@ -45,7 +45,7 @@ Push and pull it back.
 ``` ucm
 proj/main> push @transcripts/proj/main
 
-  Uploaded 521 entities.
+  Uploaded 476 entities.
 
   I just created @transcripts/proj on http://localhost:5424
 
@@ -71,7 +71,7 @@ proj/pulled> ls .
   4. B.       (2 terms)
   5. a        ('Nat)
   6. b        ('Nat)
-  7. builtin. (764 terms, 118 types)
+  7. builtin. (685 terms, 98 types)
   8. xs       (['Nat])
   9. ys       ([Nat])
 ```
@@ -141,24 +141,31 @@ Pull to trigger local merge
 ``` ucm :error
 proj/diverge> pull @transcripts/proj/main
 
-  I couldn't automatically merge remote @transcripts/proj/main
-  into proj/diverge. However, I've added the definitions that
-  need attention to the top of scratch.u.
+  I couldn't automatically pull remote @transcripts/proj/main
+  into proj/diverge.
 
-  When you're done, you can run
+  You're now on a temporary branch,
+  merge-remote-main-into-diverge, and the definitions to fix are
+  in pull-remote-main-into-diverge-201f68ca.u.
 
-    update
+  Edit the file, then run:
 
-  to merge your changes back into diverge and delete the
-  temporary branch. Or, if you decide to cancel the merge
-  instead, you can run
+      proj/merge-remote-main-into-diverge> load pull-remote-main-into-diverge-201f68ca.u
 
-    cancel
+  If `load` reports errors, fix them and run it again. When the
+  file loads with no errors, run:
 
-  to delete the temporary branch and switch back to diverge.
+      proj/merge-remote-main-into-diverge> update
+
+  `update` saves the file's definitions into diverge, removes
+  any definitions you deleted from the file, and deletes the
+  temporary branch. To abandon the pull instead, run `cancel`.
+
+  Note: Definitions listed in the file don't exist in the branch
+  until a successful `update`.
 ```
 
-``` unison :added-by-ucm scratch.u
+``` unison :added-by-ucm pull-remote-main-into-diverge-201f68ca.u
 -- proj/diverge
 diverge : Nat
 diverge = 200
