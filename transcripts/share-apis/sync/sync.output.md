@@ -146,11 +146,11 @@ proj/diverge> pull @transcripts/proj/main
 
   You're now on a temporary branch,
   merge-remote-main-into-diverge, and the definitions to fix are
-  in pull-remote-main-into-diverge-201f68ca.u.
+  in pull-remote-main-into-diverge-e265468b.u.
 
   Edit the file, then run:
 
-      proj/merge-remote-main-into-diverge> load pull-remote-main-into-diverge-201f68ca.u
+      proj/merge-remote-main-into-diverge> load pull-remote-main-into-diverge-e265468b.u
 
   If `load` reports errors, fix them and run it again. When the
   file loads with no errors, run:
@@ -165,7 +165,7 @@ proj/diverge> pull @transcripts/proj/main
   until a successful `update`.
 ```
 
-``` unison :added-by-ucm pull-remote-main-into-diverge-201f68ca.u
+``` unison :added-by-ucm pull-remote-main-into-diverge-e265468b.u
 -- proj/diverge
 diverge : Nat
 diverge = 200
